@@ -1,0 +1,35 @@
+# Secrets — never commit
+tokens/
+credentials.json
+tokens.zip
+uploads/
+
+# Local runtime data (commit only *.example.json)
+data/bot_config.json
+data/trigger_state.json
+data/triggers.json
+data/known_senders.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+*.egg
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
