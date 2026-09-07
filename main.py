@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import re
@@ -95,11 +96,11 @@ async def _prompt_setup_hint(update: Update) -> None:
         "Варианты:\n"
         "• «Все почты» → «➕ Добавить аккаунт» (Device OAuth)\n"
         "• «➕ Добавить почту» (файл token_*.json)\n"
-        "• пришлите **tokens.zip** (`credentials.json` + `token_*.json`)"
+        "• пришлите tokens.zip (credentials.json + token_*.json)"
     )
     target = update.effective_message
     if target:
-        await target.reply_text(text, parse_mode="Markdown")
+        await target.reply_text(text)
 
 
 async def start_device_auth_flow(
@@ -151,12 +152,13 @@ async def start_device_auth_flow(
             or "https://www.google.com/device"
         )
         minutes = max(1, int(device_info["expires_in"]) // 60)
+        user_code = device_info.get("user_code") or ""
         await bot.send_message(
             chat_id,
-            f"🔑 Перейдите на {verification_url} и введите код:\n\n"
-            f"`{device_info['user_code']}`\n\n"
+            f"🔑 Перейдите на {html.escape(verification_url)} и введите код:\n\n"
+            f"<code>{html.escape(user_code)}</code>\n\n"
             f"Код действителен {minutes} мин. Как только вы авторизуетесь — бот сам продолжит.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
 
         result = await device_auth.poll_for_token(
@@ -360,11 +362,10 @@ async def start_add_account_flow(
 
     if not device_auth.credentials_device_exists():
         await reply(
-            "⚠️ Не найден `credentials_device.json`.\n\n"
+            "⚠️ Не найден credentials_device.json.\n\n"
             "Создайте OAuth-клиент типа «TVs and Limited Input devices» "
             "в Google Cloud Console и пришлите файл credentials_device.json.",
             reply_markup=_back_to_accounts_kb() if query and not via_message else None,
-            parse_mode="Markdown",
         )
         context.user_data["waiting_for_credentials_device"] = True
         return

@@ -212,17 +212,17 @@ async def start_add_email_file(update: Update, context: ContextTypes.DEFAULT_TYP
     reply_markup = InlineKeyboardMarkup(keyboard)
     text = (
         "➕ Добавить почту\n\n"
-        "Пришлите файл `token_*.json`, полученный через `auth.py` "
+        "Пришлите файл token_*.json, полученный через auth.py "
         "(Desktop OAuth).\n\n"
-        "Файл будет сохранён в `tokens/` и аккаунт появится в списке."
+        "Файл будет сохранён в tokens/ и аккаунт появится в списке."
     )
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            text, reply_markup=reply_markup, parse_mode="Markdown"
+            text, reply_markup=reply_markup
         )
     elif update.message:
         await update.message.reply_text(
-            text, reply_markup=reply_markup, parse_mode="Markdown"
+            text, reply_markup=reply_markup
         )
 
 async def show_account_messages(update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str) -> None:

@@ -131,9 +131,8 @@ async def process_trigger_input(update: Update, context: ContextTypes.DEFAULT_TY
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        f"✅ Триггер на *{sender_name} ({sender_email})* установлен на все аккаунты.",
+        f"✅ Триггер на {sender_name} ({sender_email}) установлен на все аккаунты.",
         reply_markup=reply_markup,
-        parse_mode='Markdown'
     )
 
 async def show_trigger_details(update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str) -> None:
@@ -235,9 +234,8 @@ async def process_trigger_edit_input(update: Update, context: ContextTypes.DEFAU
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await update.message.reply_text(
-            f"✅ Триггер обновлён: *{sender_name} ({sender_email})*",
+            f"✅ Триггер обновлён: {sender_name} ({sender_email})",
             reply_markup=reply_markup,
-            parse_mode='Markdown'
         )
     else:
         await update.message.reply_text("❌ Ошибка при обновлении триггера")
