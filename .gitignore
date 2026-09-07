@@ -1,6 +1,7 @@
 # Secrets — never commit
 tokens/
 credentials.json
+credentials_web.json
 tokens.zip
 uploads/
 
@@ -9,6 +10,8 @@ data/bot_config.json
 data/trigger_state.json
 data/triggers.json
 data/known_senders.json
+data/pending_registrations.json
+data/history_state.json
 
 # Python
 __pycache__/

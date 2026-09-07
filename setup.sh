@@ -25,7 +25,11 @@ mkdir -p tokens data uploads
 
 if [ ! -f data/bot_config.json ]; then
   cp data/bot_config.example.json data/bot_config.json
-  echo "⚠️  Создан data/bot_config.json — укажите свой Telegram user id"
+  echo "⚠️  Создан data/bot_config.json — owner_id заполнится при первом /start"
+fi
+
+if [ ! -f data/pending_registrations.json ]; then
+  echo '[]' > data/pending_registrations.json
 fi
 
 if [ ! -f credentials.json ] || [ -z "$(ls tokens/token_*.json 2>/dev/null)" ]; then

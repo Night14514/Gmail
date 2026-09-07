@@ -357,8 +357,127 @@ class GmailClient:
     def get_all_accounts(self) -> Dict[str, AccountInfo]:
         return self.accounts
 
+    def has_account(self, email: str) -> bool:
+        return email.lower().strip() in {e.lower() for e in self.accounts}
+
     def reload_accounts(self) -> None:
         self.accounts.clear()
         self.id_to_email.clear()
         self.email_to_id.clear()
         self._load_accounts()
+
+    def add_account_from_json_bytes(self, raw_json: bytes) -> tuple[bool, str, Optional[str]]:
+        """
+        Add/replace a Gmail account from OAuth token JSON bytes.
+        Returns (ok, message, email).
+        """
+        try:
+            token_data = json.loads(raw_json.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            return False, f"Невалидный JSON: {e}", None
+
+        try:
+            creds = Credentials.from_authorized_user_info(token_data)
+            service = build("gmail", "v1", credentials=creds)
+            profile = service.users().getProfile(userId="me").execute()
+            email = profile["emailAddress"]
+        except Exception as e:
+            return False, f"Не удалось проверить токен: {e}", None
+
+        os.makedirs(self.tokens_dir, exist_ok=True)
+        # Sanitize filename
+        safe_email = email.replace("/", "_").replace("\\", "_")
+        token_path = os.path.join(self.tokens_dir, f"token_{safe_email}.json")
+
+        try:
+            with open(token_path, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+        except OSError as e:
+            return False, f"Не удалось сохранить токен: {e}", email
+
+        account_id = self._register_account_id(email)
+        self.accounts[email] = AccountInfo(
+            email=email,
+            token_path=token_path,
+            account_id=account_id,
+            status="active",
+            credentials=creds,
+            service=service,
+        )
+        return True, "аккаунт добавлен", email
+
+    def get_profile_history_id(self, email: str) -> Optional[str]:
+        """Return current mailbox historyId from users.getProfile."""
+        if email not in self.accounts:
+            return None
+        account = self.accounts[email]
+        if not self._ensure_valid_credentials(account):
+            return None
+        try:
+            service = build("gmail", "v1", credentials=account.credentials)
+            profile = service.users().getProfile(userId="me").execute()
+            hid = profile.get("historyId")
+            return str(hid) if hid is not None else None
+        except Exception as e:
+            print(f"Error getting historyId for {email}: {e}")
+            return None
+
+    def list_history_message_ids(
+        self, email: str, start_history_id: str
+    ) -> Dict[str, Any]:
+        """
+        List message IDs added since start_history_id via users.history.list.
+        Returns {"message_ids": [...], "history_id": "..."} or {"error": "..."}.
+        On historyId expired/invalid, returns {"error": "history_expired"}.
+        """
+        if email not in self.accounts:
+            return {"error": "Account not found"}
+
+        account = self.accounts[email]
+        if not self._ensure_valid_credentials(account):
+            return {"error": "Invalid credentials"}
+
+        try:
+            service = build("gmail", "v1", credentials=account.credentials)
+            message_ids: List[str] = []
+            page_token = None
+            newest_history_id = start_history_id
+
+            while True:
+                kwargs: Dict[str, Any] = {
+                    "userId": "me",
+                    "startHistoryId": start_history_id,
+                    "historyTypes": ["messageAdded"],
+                    "maxResults": 100,
+                }
+                if page_token:
+                    kwargs["pageToken"] = page_token
+
+                result = service.users().history().list(**kwargs).execute()
+                if result.get("historyId"):
+                    newest_history_id = str(result["historyId"])
+
+                for record in result.get("history") or []:
+                    for added in record.get("messagesAdded") or []:
+                        msg = added.get("message") or {}
+                        mid = msg.get("id")
+                        if mid and mid not in message_ids:
+                            message_ids.append(mid)
+
+                page_token = result.get("nextPageToken")
+                if not page_token:
+                    break
+
+            account.status = "active"
+            return {"message_ids": message_ids, "history_id": newest_history_id}
+        except HttpError as e:
+            # 404 = startHistoryId is too old / invalid
+            if e.resp is not None and e.resp.status in (404, 400):
+                return {"error": "history_expired"}
+            account.status = "error"
+            print(f"HTTP error listing history for {email}: {e}")
+            return {"error": str(e)}
+        except Exception as e:
+            account.status = "error"
+            print(f"Error listing history for {email}: {e}")
+            return {"error": str(e)}

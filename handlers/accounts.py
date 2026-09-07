@@ -143,52 +143,87 @@ async def show_accounts_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     accounts = gmail_client.get_all_accounts()
     account_list = list(accounts.values())
     
+    # Top action: web OAuth add (feature 4)
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add_account")]
+    ]
+
     if not account_list:
-        keyboard = [
+        keyboard.append(
+            [InlineKeyboardButton("➕ Добавить почту", callback_data="add_email_file")]
+        )
+        keyboard.append(
             [InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]
-        ]
+        )
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.callback_query.edit_message_text(
-            "Нет подключённых аккаунтов",
-            reply_markup=reply_markup
+            "Нет подключённых аккаунтов\n\n"
+            "Добавьте аккаунт по ссылке или загрузите token_*.json.",
+            reply_markup=reply_markup,
         )
         return
-    
+
     total_pages = (len(account_list) + ACCOUNTS_PER_PAGE - 1) // ACCOUNTS_PER_PAGE
     page = max(0, min(page, total_pages - 1))
-    
+
     start_idx = page * ACCOUNTS_PER_PAGE
     end_idx = min(start_idx + ACCOUNTS_PER_PAGE, len(account_list))
     page_accounts = account_list[start_idx:end_idx]
-    
-    keyboard = []
+
     for account in page_accounts:
         status_emoji = get_status_emoji(account.status)
         account_id = account.account_id or gmail_client.get_account_id(account.email)
         keyboard.append([
             InlineKeyboardButton(
                 f"{status_emoji} {account.email}",
-                callback_data=f"account:{account_id}:0"
+                callback_data=f"account:{account_id}:0",
             )
         ])
-    
+
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"accounts_page:{page-1}"))
     if page < total_pages - 1:
         nav_row.append(InlineKeyboardButton("Вперёд ➡️", callback_data=f"accounts_page:{page+1}"))
-    
+
     if nav_row:
         keyboard.append(nav_row)
-    
+
+    # Manual token file upload (feature 2) — between nav and main menu
+    keyboard.append(
+        [InlineKeyboardButton("➕ Добавить почту", callback_data="add_email_file")]
+    )
     keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")])
-    
+
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await update.callback_query.edit_message_text(
         f"📧 Аккаунты (страница {page + 1}/{total_pages}):",
-        reply_markup=reply_markup
+        reply_markup=reply_markup,
     )
+
+
+async def start_add_email_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Prompt owner to upload a token_*.json file."""
+    context.user_data["waiting_for_token_json"] = True
+    keyboard = [
+        [InlineKeyboardButton("🔙 К списку почт", callback_data="accounts_page:0")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    text = (
+        "➕ Добавить почту\n\n"
+        "Пришлите файл `token_*.json`, полученный через `auth.py` "
+        "(Desktop OAuth).\n\n"
+        "Файл будет сохранён в `tokens/` и аккаунт появится в списке."
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
+    elif update.message:
+        await update.message.reply_text(
+            text, reply_markup=reply_markup, parse_mode="Markdown"
+        )
 
 async def show_account_messages(update: Update, context: ContextTypes.DEFAULT_TYPE, callback_data: str) -> None:
     gmail_client = context.bot_data.get('gmail_client')

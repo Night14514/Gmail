@@ -41,10 +41,13 @@ def list_token_files(root: Path | None = None) -> List[Path]:
 
 
 def environment_ready(root: Path | None = None) -> bool:
+    """Ready when at least one token exists (tokens are self-contained for Gmail API)."""
     root = root or project_root()
-    has_credentials = credentials_path(root).is_file()
-    has_tokens = len(list_token_files(root)) > 0
-    return has_credentials and has_tokens
+    return len(list_token_files(root)) > 0
+
+
+def credentials_web_path(root: Path | None = None) -> Path:
+    return (root or project_root()) / "credentials_web.json"
 
 
 def environment_status(root: Path | None = None) -> dict:
@@ -53,6 +56,7 @@ def environment_status(root: Path | None = None) -> dict:
     return {
         "ready": environment_ready(root),
         "has_credentials": credentials_path(root).is_file(),
+        "has_credentials_web": credentials_web_path(root).is_file(),
         "token_count": len(token_files),
         "credentials_path": str(credentials_path(root)),
         "tokens_dir": str(tokens_dir(root)),
