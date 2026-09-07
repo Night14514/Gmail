@@ -1,7 +1,7 @@
 # Secrets — never commit
 tokens/
 credentials.json
-credentials_web.json
+credentials_device.json
 tokens.zip
 uploads/
 

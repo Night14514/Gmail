@@ -143,7 +143,7 @@ async def show_accounts_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     accounts = gmail_client.get_all_accounts()
     account_list = list(accounts.values())
     
-    # Top action: web OAuth add (feature 4)
+    # Top action: Device OAuth add
     keyboard = [
         [InlineKeyboardButton("➕ Добавить аккаунт", callback_data="add_account")]
     ]

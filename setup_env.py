@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 import tempfile
 import zipfile
@@ -13,6 +12,7 @@ from typing import List, Tuple
 logger = logging.getLogger(__name__)
 
 CREDENTIALS_NAME = "credentials.json"
+CREDENTIALS_DEVICE_NAME = "credentials_device.json"
 TOKENS_DIR_NAME = "tokens"
 TOKEN_PREFIX = "token_"
 TOKEN_SUFFIX = ".json"
@@ -24,6 +24,10 @@ def project_root() -> Path:
 
 def credentials_path(root: Path | None = None) -> Path:
     return (root or project_root()) / CREDENTIALS_NAME
+
+
+def credentials_device_path(root: Path | None = None) -> Path:
+    return (root or project_root()) / CREDENTIALS_DEVICE_NAME
 
 
 def tokens_dir(root: Path | None = None) -> Path:
@@ -46,17 +50,13 @@ def environment_ready(root: Path | None = None) -> bool:
     return len(list_token_files(root)) > 0
 
 
-def credentials_web_path(root: Path | None = None) -> Path:
-    return (root or project_root()) / "credentials_web.json"
-
-
 def environment_status(root: Path | None = None) -> dict:
     root = root or project_root()
     token_files = list_token_files(root)
     return {
         "ready": environment_ready(root),
         "has_credentials": credentials_path(root).is_file(),
-        "has_credentials_web": credentials_web_path(root).is_file(),
+        "has_credentials_device": credentials_device_path(root).is_file(),
         "token_count": len(token_files),
         "credentials_path": str(credentials_path(root)),
         "tokens_dir": str(tokens_dir(root)),

@@ -2,13 +2,16 @@ import asyncio
 import logging
 import os
 import re
+from io import BytesIO
 
+from google.oauth2.credentials import Credentials as UserCredentials
 from telegram import (
     Update,
     BotCommand,
     MenuButtonCommands,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputFile,
 )
 from telegram.ext import (
     Application,
@@ -24,8 +27,7 @@ from storage import Storage
 from handlers import accounts, triggers, activity
 from background_jobs import start_background_jobs
 from setup_env import environment_ready, environment_status, install_tokens_zip, project_root
-import ngrok_manager
-import web_auth_server
+import device_auth
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,13 +38,6 @@ logger = logging.getLogger(__name__)
 TOKENS_DIR = "tokens"
 DATA_DIR = "data"
 UPLOADS_DIR = "uploads"
-
-NGROK_NO_DOMAIN_MESSAGE = (
-    "⚠️ Не настроен статический домен ngrok.\n"
-    "1. Зарегистрируйте бесплатный статический домен на dashboard.ngrok.com\n"
-    "2. Пропишите в Google Cloud Console redirect URI: https://<домен>/oauth2callback\n"
-    "3. Установите переменную окружения NGROK_STATIC_DOMAIN=<домен> и перезапустите бота"
-)
 
 EMAIL_RE = re.compile(r"^[\w.\-+]+@[\w\-]+\.[\w.\-]+$")
 
@@ -62,26 +57,6 @@ def get_role(update: Update, storage: Storage) -> str:
 def _setup_needed(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """True when there are no Gmail accounts yet (soft — menu still available)."""
     return not context.bot_data.get("env_ready", False)
-
-
-def _ngrok_domain() -> str:
-    domain = (os.environ.get("NGROK_STATIC_DOMAIN") or "").strip()
-    return domain.replace("https://", "").replace("http://", "").rstrip("/")
-
-
-async def _ensure_tunnel_async(domain: str):
-    return await asyncio.to_thread(ngrok_manager.ensure_tunnel, domain)
-
-
-def owner_auth_state(context: ContextTypes.DEFAULT_TYPE) -> str:
-    existing = context.bot_data.get("owner_auth_state")
-    if existing and existing in web_auth_server.pending_states:
-        return existing
-    storage: Storage = context.bot_data["storage"]
-    owner_chat_id = storage.resolve_notify_chat_id()
-    token = web_auth_server.register_state(owner_chat_id, role="owner_self_add")
-    context.bot_data["owner_auth_state"] = token
-    return token
 
 
 def _back_to_accounts_kb() -> InlineKeyboardMarkup:
@@ -118,7 +93,7 @@ async def _prompt_setup_hint(update: Update) -> None:
     text = (
         "⚙️ Пока нет подключённых почт.\n\n"
         "Варианты:\n"
-        "• «Все почты» → «➕ Добавить аккаунт» (веб-OAuth)\n"
+        "• «Все почты» → «➕ Добавить аккаунт» (Device OAuth)\n"
         "• «➕ Добавить почту» (файл token_*.json)\n"
         "• пришлите **tokens.zip** (`credentials.json` + `token_*.json`)"
     )
@@ -127,28 +102,181 @@ async def _prompt_setup_hint(update: Update) -> None:
         await target.reply_text(text, parse_mode="Markdown")
 
 
-async def _build_user_oauth_link(
-    context: ContextTypes.DEFAULT_TYPE, request: dict
-) -> tuple[bool, str]:
-    """Returns (ok, link_or_error_message). Does NOT change registration status."""
-    domain = _ngrok_domain()
-    if not domain:
-        return False, NGROK_NO_DOMAIN_MESSAGE
-    if not web_auth_server.credentials_web_exists():
-        return False, "Нет credentials_web.json на сервере."
+async def start_device_auth_flow(
+    bot,
+    chat_id: str,
+    gmail_client: GmailClient,
+    storage: Storage,
+    bot_data: dict,
+    *,
+    expected_email: str | None = None,
+    notify_owner_on_success: bool = False,
+    registration_id: str | None = None,
+    application: Application | None = None,
+) -> None:
+    """Run OAuth Device Authorization Grant for one chat; no parallel flows per chat."""
+    active = bot_data.setdefault("active_device_auths", set())
+    chat_key = str(chat_id)
+    if chat_key in active:
+        await bot.send_message(
+            chat_id, "⏳ Уже идёт авторизация, дождитесь её завершения."
+        )
+        return
 
-    ok, result = await _ensure_tunnel_async(domain)
-    if not ok:
-        return False, f"Не удалось поднять ngrok: {result}"
+    active.add(chat_key)
+    try:
+        try:
+            creds_data = device_auth.load_device_client_creds()
+        except Exception as e:
+            await bot.send_message(
+                chat_id,
+                f"❌ Не удалось прочитать credentials_device.json: {e}",
+            )
+            return
 
-    state = web_auth_server.register_state(
-        request["chat_id"],
-        role="user_add",
-        expected_email=request.get("email"),
-        registration_id=request.get("id"),
+        client_id = creds_data["client_id"]
+        client_secret = creds_data["client_secret"]
+
+        try:
+            device_info = await device_auth.request_device_code(client_id)
+        except Exception as e:
+            await bot.send_message(
+                chat_id, f"❌ Не удалось получить код авторизации: {e}"
+            )
+            return
+
+        verification_url = (
+            device_info.get("verification_url")
+            or device_info.get("verification_uri")
+            or "https://www.google.com/device"
+        )
+        minutes = max(1, int(device_info["expires_in"]) // 60)
+        await bot.send_message(
+            chat_id,
+            f"🔑 Перейдите на {verification_url} и введите код:\n\n"
+            f"`{device_info['user_code']}`\n\n"
+            f"Код действителен {minutes} мин. Как только вы авторизуетесь — бот сам продолжит.",
+            parse_mode="Markdown",
+        )
+
+        result = await device_auth.poll_for_token(
+            client_id,
+            client_secret,
+            device_info["device_code"],
+            int(device_info.get("interval", 5)),
+            int(device_info["expires_in"]),
+        )
+
+        if not result["ok"]:
+            reasons = {
+                "access_denied": "❌ Вы отклонили запрос доступа.",
+                "expired_token": "❌ Время на ввод кода истекло. Попробуйте снова.",
+            }
+            await bot.send_message(
+                chat_id,
+                reasons.get(
+                    result["reason"],
+                    f"❌ Ошибка авторизации: {result['reason']}",
+                ),
+            )
+            return
+
+        tokens = result["tokens"]
+        scope_raw = tokens.get("scope", device_auth.SCOPES)
+        scopes = scope_raw.split() if isinstance(scope_raw, str) else list(scope_raw)
+        creds = UserCredentials(
+            token=tokens["access_token"],
+            refresh_token=tokens.get("refresh_token"),
+            token_uri=device_auth.TOKEN_URL,
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=scopes,
+        )
+        raw_json = creds.to_json().encode("utf-8")
+
+        ok, message, email = gmail_client.add_account_from_json_bytes(raw_json)
+        if not ok:
+            await bot.send_message(
+                chat_id, f"❌ Не удалось подключить почту: {message}"
+            )
+            return
+
+        if expected_email and email.lower() != expected_email.lower():
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Вы авторизовались как {email}, а заявка была на {expected_email}. "
+                "Почта всё равно подключена, но проверьте, что это правильный аккаунт.",
+            )
+
+        if registration_id:
+            try:
+                storage.update_registration_status(registration_id, "completed")
+            except Exception:
+                logger.exception("Failed to mark registration completed")
+
+        if application is not None:
+            _maybe_start_jobs(application)
+
+        await bot.send_message(chat_id, f"✅ Почта {email} подключена ({message}).")
+
+        filename = f"token_{email}.json"
+
+        if notify_owner_on_success:
+            owner_chat_id = storage.resolve_notify_chat_id()
+            if owner_chat_id and str(owner_chat_id) != str(chat_id):
+                await bot.send_message(
+                    owner_chat_id, f"✅ Пользователь подключил почту {email}."
+                )
+                await bot.send_document(
+                    owner_chat_id,
+                    document=InputFile(BytesIO(raw_json), filename=filename),
+                    caption="Резервная копия конфигурации.",
+                )
+        else:
+            await bot.send_document(
+                chat_id,
+                document=InputFile(BytesIO(raw_json), filename=filename),
+                caption=(
+                    "Резервная копия конфигурации — сохраните на случай сбоя сервера."
+                ),
+            )
+    except Exception:
+        logger.exception("Device auth flow failed for chat %s", chat_id)
+        try:
+            await bot.send_message(chat_id, "❌ Сбой авторизации. Попробуйте снова.")
+        except Exception:
+            pass
+    finally:
+        active.discard(chat_key)
+
+
+def _schedule_device_auth(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: str,
+    *,
+    expected_email: str | None = None,
+    notify_owner_on_success: bool = False,
+    registration_id: str | None = None,
+) -> bool:
+    """Create device-auth task if no parallel flow for chat. Returns False if busy."""
+    active = context.bot_data.setdefault("active_device_auths", set())
+    chat_key = str(chat_id)
+    if chat_key in active:
+        return False
+    asyncio.create_task(
+        start_device_auth_flow(
+            context.bot,
+            chat_key,
+            context.bot_data["gmail_client"],
+            context.bot_data["storage"],
+            context.bot_data,
+            expected_email=expected_email,
+            notify_owner_on_success=notify_owner_on_success,
+            registration_id=registration_id,
+            application=context.application,
+        )
     )
-    link = f"{result}/authorize?state={state}"
-    return True, link
+    return True
 
 
 async def handle_guest_flow(
@@ -184,18 +312,26 @@ async def handle_guest_flow(
         )
         context.user_data["awaiting_registration_email"] = True
     elif request["status"] == "approved":
-        # Resend one-time OAuth link
-        ok, result = await _build_user_oauth_link(context, request)
-        if ok:
+        if not device_auth.credentials_device_exists():
             await update.message.reply_text(
-                f"✅ Ваша заявка уже подтверждена. Новая ссылка (2 часа, одноразовая):\n"
-                f"{result}"
+                "Заявка подтверждена, но на сервере нет credentials_device.json. "
+                "Напишите владельцу."
             )
-        else:
+            return
+        if not _schedule_device_auth(
+            context,
+            str(request["chat_id"]),
+            expected_email=request.get("email"),
+            notify_owner_on_success=True,
+            registration_id=request.get("id"),
+        ):
             await update.message.reply_text(
-                "Заявка подтверждена, но не удалось выдать ссылку:\n"
-                f"{result}\n\nПопробуйте /start позже или напишите владельцу."
+                "⏳ Уже идёт авторизация, дождитесь её завершения."
             )
+            return
+        await update.message.reply_text(
+            "✅ Ваша заявка уже подтверждена. Запрашиваю код авторизации у Google…"
+        )
     elif request["status"] == "completed":
         await update.message.reply_text(
             "Вы уже зарегистрированы. Введите /new, чтобы добавить ещё одну почту."
@@ -210,78 +346,39 @@ async def handle_guest_flow(
 async def start_add_account_flow(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, via_message: bool = False
 ) -> None:
-    """Owner: start web OAuth account add (feature 4)."""
+    """Owner: start Device Authorization Grant account add."""
     query = update.callback_query
     reply = (
         (lambda text, **kw: query.edit_message_text(text, **kw))
         if query and not via_message
         else (lambda text, **kw: update.effective_message.reply_text(text, **kw))
     )
+    chat = update.effective_chat
+    if not chat:
+        return
+    chat_id = str(chat.id)
 
-    if not web_auth_server.credentials_web_exists():
+    if not device_auth.credentials_device_exists():
         await reply(
-            "⚠️ Не найден `credentials_web.json`.\n\n"
-            "Пришлите файл credentials_web.json (OAuth-клиент типа "
-            "«Веб-приложение») — бот сохранит его в корень проекта.",
+            "⚠️ Не найден `credentials_device.json`.\n\n"
+            "Создайте OAuth-клиент типа «TVs and Limited Input devices» "
+            "в Google Cloud Console и пришлите файл credentials_device.json.",
             reply_markup=_back_to_accounts_kb() if query and not via_message else None,
+            parse_mode="Markdown",
         )
-        context.user_data["waiting_for_credentials_web"] = True
+        context.user_data["waiting_for_credentials_device"] = True
         return
 
-    domain = _ngrok_domain()
-    if not domain:
+    active = context.bot_data.setdefault("active_device_auths", set())
+    if chat_id in active:
         await reply(
-            NGROK_NO_DOMAIN_MESSAGE,
-            reply_markup=_back_to_accounts_kb() if query and not via_message else None,
-        )
-        return
-
-    ok, result = await _ensure_tunnel_async(domain)
-    if ok:
-        link = f"{result}/authorize?state={owner_auth_state(context)}"
-        await reply(
-            f"🔗 Ваша ссылка для добавления аккаунтов:\n{link}\n\n"
-            "Перейдите по ней и авторизуйтесь в нужном Google-аккаунте.",
+            "⏳ Уже идёт авторизация, дождитесь её завершения.",
             reply_markup=_back_to_accounts_kb() if query and not via_message else None,
         )
         return
 
-    if result == "no_authtoken":
-        context.user_data["waiting_for_ngrok_token"] = True
-        await reply(
-            "⚠️ Ngrok не авторизован на сервере.\n\n"
-            "Пришлите ваш authtoken (получить: "
-            "https://dashboard.ngrok.com/get-started/your-authtoken)"
-        )
-    elif result == "invalid_authtoken":
-        context.user_data["waiting_for_ngrok_token"] = True
-        await reply("❌ Присланный authtoken недействителен. Пришлите его ещё раз.")
-    elif result == "session_limit":
-        await reply(
-            "❌ У ngrok уже есть активная сессия в другом месте. "
-            "Остановите её и нажмите кнопку ещё раз.",
-            reply_markup=_back_to_accounts_kb() if query and not via_message else None,
-        )
-    elif result == "port_busy":
-        await reply(
-            "❌ Порт 5000 уже занят другим процессом на сервере.",
-            reply_markup=_back_to_accounts_kb() if query and not via_message else None,
-        )
-    elif result == "not_installed":
-        await reply(
-            "❌ ngrok не установлен на сервере. Установите: https://ngrok.com/download",
-            reply_markup=_back_to_accounts_kb() if query and not via_message else None,
-        )
-    elif result == "no_domain":
-        await reply(
-            NGROK_NO_DOMAIN_MESSAGE,
-            reply_markup=_back_to_accounts_kb() if query and not via_message else None,
-        )
-    else:
-        await reply(
-            f"❌ Неизвестная ошибка ngrok: {result}",
-            reply_markup=_back_to_accounts_kb() if query and not via_message else None,
-        )
+    await reply("⏳ Запрашиваю код авторизации у Google…")
+    _schedule_device_auth(context, chat_id, notify_owner_on_success=False)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -348,27 +445,34 @@ async def handle_approve_reg(
 
     await query.answer()
 
-    # Build link FIRST — only then mark approved (no dead-end)
-    ok, result = await _build_user_oauth_link(context, request)
-    if not ok:
+    if not device_auth.credentials_device_exists():
         await query.edit_message_text(
-            f"⚠️ Не удалось выдать ссылку для {request['email']}:\n{result}\n\n"
-            "Заявка остаётся в статусе pending — исправьте проблему и нажмите "
+            f"⚠️ Не найден credentials_device.json — нельзя запустить авторизацию "
+            f"для {request['email']}.\n\n"
+            "Заявка остаётся в статусе pending — пришлите файл и нажмите "
             "✅ Подтвердить снова."
+        )
+        return
+
+    active = context.bot_data.setdefault("active_device_auths", set())
+    if str(request["chat_id"]) in active:
+        await query.edit_message_text(
+            f"⏳ Для пользователя уже идёт авторизация. Дождитесь завершения "
+            f"и при необходимости нажмите ✅ снова (заявка пока pending)."
         )
         return
 
     storage.update_registration_status(request_id, "approved")
     storage.ensure_user_allowed_contributor(request["user_id"])
-
-    await context.bot.send_message(
-        request["chat_id"],
-        f"✅ Ваша заявка подтверждена! Перейдите по ссылке для авторизации:\n{result}\n\n"
-        "Ссылка одноразовая и действует 2 часа. Авторизуйтесь именно тем Google-аккаунтом, "
-        f"который указали в заявке ({request['email']}).",
-    )
     await query.edit_message_text(
-        f"✅ Подтверждено: {request['email']}\nСсылка отправлена пользователю."
+        f"✅ Подтверждено: {request['email']}\nЗапускаю авторизацию для пользователя…"
+    )
+    _schedule_device_auth(
+        context,
+        str(request["chat_id"]),
+        expected_email=request["email"],
+        notify_owner_on_success=True,
+        registration_id=request_id,
     )
 
 
@@ -557,35 +661,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("Доступ запрещён")
         return
 
-    if user_data.get("waiting_for_ngrok_token"):
-        token = (update.message.text or "").strip()
-        user_data["waiting_for_ngrok_token"] = False
-        ok, msg = await asyncio.to_thread(ngrok_manager.add_authtoken, token)
-        if not ok:
-            await update.message.reply_text(f"❌ Не удалось применить authtoken: {msg}")
-            return
-        await update.message.reply_text("✅ Authtoken применён, поднимаю туннель…")
-        domain = _ngrok_domain()
-        if not domain:
-            await update.message.reply_text(NGROK_NO_DOMAIN_MESSAGE)
-            return
-        ok, result = await _ensure_tunnel_async(domain)
-        if ok:
-            link = f"{result}/authorize?state={owner_auth_state(context)}"
-            await update.message.reply_text(
-                f"🔗 Ваша ссылка для добавления аккаунтов:\n{link}"
-            )
-        else:
-            await update.message.reply_text(f"❌ Не удалось поднять туннель: {result}")
-        return
-
     if user_data.get("waiting_for_trigger_input"):
         await triggers.process_trigger_input(update, context)
     elif user_data.get("waiting_for_trigger_edit"):
         await triggers.process_trigger_edit_input(update, context)
     elif user_data.get("waiting_for_activity_sender"):
         await activity.process_sender_input(update, context)
-    elif user_data.get("waiting_for_token_json") or user_data.get("waiting_for_credentials_web"):
+    elif user_data.get("waiting_for_token_json") or user_data.get(
+        "waiting_for_credentials_device"
+    ):
         await update.message.reply_text("Ожидается файл, а не текст. Пришлите документ.")
     elif _setup_needed(context):
         await _prompt_setup_hint(update)
@@ -609,23 +693,25 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     gmail_client: GmailClient = context.bot_data["gmail_client"]
 
     if (
-        filename_lower == "credentials_web.json"
-        or context.user_data.get("waiting_for_credentials_web")
+        filename_lower == "credentials_device.json"
+        or context.user_data.get("waiting_for_credentials_device")
     ):
-        if filename_lower != "credentials_web.json":
-            await update.message.reply_text("Нужен файл с именем credentials_web.json")
+        if filename_lower != "credentials_device.json":
+            await update.message.reply_text(
+                "Нужен файл с именем credentials_device.json"
+            )
             return
-        dest = web_auth_server.credentials_web_path()
+        dest = device_auth.credentials_device_path()
         try:
             tg_file = await doc.get_file()
             await tg_file.download_to_drive(custom_path=str(dest))
         except Exception as e:
-            logger.exception("Failed to save credentials_web.json")
+            logger.exception("Failed to save credentials_device.json")
             await update.message.reply_text(f"❌ Не удалось сохранить файл: {e}")
             return
-        context.user_data["waiting_for_credentials_web"] = False
+        context.user_data["waiting_for_credentials_device"] = False
         await update.message.reply_text(
-            "✅ credentials_web.json сохранён. Нажмите «➕ Добавить аккаунт» снова."
+            "✅ credentials_device.json сохранён. Нажмите «➕ Добавить аккаунт» снова."
         )
         return
 
@@ -682,7 +768,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     if not wants_setup:
         await update.message.reply_text(
-            "Сейчас ожидаются token_*.json, credentials_web.json или tokens.zip."
+            "Сейчас ожидаются token_*.json, credentials_device.json или tokens.zip."
         )
         return
 
@@ -759,34 +845,6 @@ async def _post_init(application: Application) -> None:
     except Exception:
         logger.exception("Failed to set bot commands / menu button")
 
-    domain = _ngrok_domain()
-    if domain:
-        try:
-            ok, result = await _ensure_tunnel_async(domain)
-            if ok:
-                logger.info("ngrok tunnel ready: %s", result)
-            else:
-                logger.warning("ngrok ensure_tunnel at startup: %s", result)
-        except Exception:
-            logger.exception("ngrok startup failed (non-fatal)")
-
-    def on_account_added(email: str) -> None:
-        logger.info("Account added via OAuth: %s", email)
-        _maybe_start_jobs(application)
-
-    try:
-        runner = await web_auth_server.start_web_server(
-            application.bot_data["gmail_client"],
-            application.bot_data["storage"],
-            application.bot,
-            on_account_added=on_account_added,
-        )
-        application.bot_data["web_server_runner"] = runner
-    except OSError as e:
-        logger.error("OAuth web server failed to bind port 5000: %s", e)
-    except Exception:
-        logger.exception("Failed to start OAuth web server")
-
 
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -798,10 +856,10 @@ def main() -> None:
     ready = environment_ready()
     status = environment_status()
     logger.info(
-        "Environment: ready=%s credentials=%s credentials_web=%s tokens=%s owner=%s",
+        "Environment: ready=%s credentials=%s credentials_device=%s tokens=%s owner=%s",
         status["ready"],
         status["has_credentials"],
-        status.get("has_credentials_web"),
+        status.get("has_credentials_device"),
         status["token_count"],
         storage.get_owner_id(),
     )
@@ -819,6 +877,7 @@ def main() -> None:
     application.bot_data["storage"] = storage
     application.bot_data["env_ready"] = ready
     application.bot_data["jobs_started"] = False
+    application.bot_data["active_device_auths"] = set()
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("new", new_command))
@@ -833,7 +892,7 @@ def main() -> None:
         application.bot_data["jobs_started"] = True
     else:
         logger.warning(
-            "No tokens yet — owner can add via OAuth, token file, or tokens.zip"
+            "No tokens yet — owner can add via Device OAuth, token file, or tokens.zip"
         )
 
     logger.info("Starting bot...")
