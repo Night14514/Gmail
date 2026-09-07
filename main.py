@@ -421,7 +421,7 @@ async def start_add_account_flow(
 
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clear pending OAuth sessions (owner: all; others: own chat only)."""
+    """Clear pending OAuth sessions and open registration requests."""
     storage = context.bot_data.get("storage")
     if not storage or not update.message:
         return
@@ -431,28 +431,47 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not user or not chat:
         return
 
-    pending = context.bot_data.setdefault("pending_oauth", {})
+    pending_oauth = context.bot_data.setdefault("pending_oauth", {})
     role = get_role(update, storage)
     chat_key = str(chat.id)
 
     if role == "owner":
-        cleared = len(pending)
-        pending.clear()
+        oauth_cleared = len(pending_oauth)
+        pending_oauth.clear()
+        regs_cleared = storage.clear_open_registrations()
         context.user_data.pop("waiting_for_credentials_desktop", None)
         context.user_data.pop("waiting_for_token_json", None)
+        context.user_data.pop("awaiting_registration_email", None)
+        if oauth_cleared == 0 and regs_cleared == 0:
+            await update.message.reply_text(
+                "🧹 Список pending пуст — очищать нечего."
+            )
+            return
         await update.message.reply_text(
-            f"🧹 Очищено pending OAuth-сессий: {cleared}."
-            if cleared
-            else "🧹 Список pending пуст — очищать нечего."
+            f"🧹 Очищено:\n"
+            f"• OAuth-сессий: {oauth_cleared}\n"
+            f"• заявок (pending/approved): {regs_cleared}"
         )
         return
 
-    if chat_key in pending:
-        pending.pop(chat_key, None)
-        await update.message.reply_text("🧹 Ваша pending-авторизация сброшена.")
-    else:
-        await update.message.reply_text("🧹 У вас нет активной pending-авторизации.")
+    oauth_cleared = 0
+    if chat_key in pending_oauth:
+        pending_oauth.pop(chat_key, None)
+        oauth_cleared = 1
+    regs_cleared = storage.clear_open_registrations(user_id=user.id)
+    context.user_data.pop("awaiting_registration_email", None)
 
+    if oauth_cleared == 0 and regs_cleared == 0:
+        await update.message.reply_text(
+            "🧹 У вас нет pending-авторизации или открытых заявок."
+        )
+        return
+    await update.message.reply_text(
+        f"🧹 Сброшено:\n"
+        f"• ваша OAuth-сессия: {'да' if oauth_cleared else 'нет'}\n"
+        f"• ваших заявок (pending/approved): {regs_cleared}\n\n"
+        "Можно снова подать почту через /start или /new."
+    )
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     storage = context.bot_data.get("storage")
@@ -919,7 +938,7 @@ async def _post_init(application: Application) -> None:
             [
                 BotCommand("start", "Открыть меню бота"),
                 BotCommand("new", "Добавить ещё одну почту"),
-                BotCommand("clear", "Сбросить pending-авторизации"),
+                BotCommand("clear", "Сбросить pending-заявки и OAuth"),
             ]
         )
         await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())

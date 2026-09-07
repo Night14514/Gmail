@@ -296,6 +296,31 @@ class Storage:
                 break
         self.save_registrations(registrations)
 
+    def clear_open_registrations(
+        self,
+        *,
+        user_id: Optional[int] = None,
+        statuses: Optional[List[str]] = None,
+    ) -> int:
+        """
+        Cancel open registration requests (default: pending + approved).
+        If user_id is set, only that user's requests are cleared.
+        Returns number of cancelled requests.
+        """
+        target_statuses = set(statuses or ["pending", "approved"])
+        registrations = self.get_registrations()
+        cleared = 0
+        for reg in registrations:
+            if reg.get("status") not in target_statuses:
+                continue
+            if user_id is not None and reg.get("user_id") != user_id:
+                continue
+            reg["status"] = "cancelled"
+            cleared += 1
+        if cleared:
+            self.save_registrations(registrations)
+        return cleared
+
     def find_registration_by_email(
         self, email: str, statuses: Optional[List[str]] = None
     ) -> Optional[Dict[str, Any]]:

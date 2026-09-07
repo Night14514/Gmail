@@ -67,7 +67,7 @@ export GOOGLE_CLOUD_PROJECT_ID='your-gcp-project-id'
 - **Триггеры** — уведомления о новых письмах (History API, ~30 с)
 - **Активность** — сканирование по отправителю
 
-Команды в меню Telegram: `/start`, `/new`, `/clear` (сброс pending OAuth).
+Команды в меню Telegram: `/start`, `/new`, `/clear` (сброс pending OAuth и открытых заявок).
 
 ## Онбординг пользователей
 
