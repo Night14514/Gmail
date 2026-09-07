@@ -39,6 +39,7 @@ export GOOGLE_CLOUD_PROJECT_ID='your-gcp-project-id'
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | токен бота (обязательно) |
 | `GOOGLE_CLOUD_PROJECT_ID` | ID проекта GCP (ссылка на Test users при одобрении) |
+| `CHECK_INTERVAL` | интервал опроса триггеров в секундах (по умолчанию `10`, диапазон 5–60) |
 
 ### Настройка Desktop OAuth (опционально)
 
@@ -56,7 +57,21 @@ export GOOGLE_CLOUD_PROJECT_ID='your-gcp-project-id'
 - `tokens/token_*.json` (достаточно для работы)
 - опционально `credentials.json` / `credentials_desktop.json`
 
-### Вариант B: первый запуск без почт
+### Вариант B: единый `tokens.zip`
+
+Пришлите боту один архив (плоский или с папкой `tokens/`):
+
+```text
+tokens.zip
+├── credentials_desktop.json   # опционально — для «Добавить аккаунт»
+├── credentials.json           # опционально
+└── tokens/
+    └── token_*.json           # обязательно ≥1
+```
+
+Переустановка zip **заменяет** все текущие `token_*.json`.
+
+### Вариант C: первый запуск без почт
 
 1. `/start` → владелец видит меню сразу.
 2. Добавить почту: OAuth-ссылка («➕ Добавить аккаунт»), файл `token_*.json` или **tokens.zip**.
@@ -64,7 +79,7 @@ export GOOGLE_CLOUD_PROJECT_ID='your-gcp-project-id'
 ## Меню владельца
 
 - **Все почты** — список; сверху «➕ Добавить аккаунт» (OAuth-ссылка), снизу «➕ Добавить почту» (файл `token_*.json`)
-- **Триггеры** — уведомления о новых письмах (History API, ~30 с)
+- **Триггеры** — уведомления о новых письмах (History API, ~10 с; env `CHECK_INTERVAL`)
 - **Активность** — сканирование по отправителю
 
 Команды в меню Telegram: `/start`, `/new`, `/clear` (сброс pending OAuth и открытых заявок).

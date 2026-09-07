@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, ContextTypes
 from gmail_client import GmailClient
@@ -14,7 +15,19 @@ from handlers.accounts import (
 
 logger = logging.getLogger(__name__)
 
-CHECK_INTERVAL = 30
+# 10s: ~half the old latency, safe for ~100 accounts (history.list is cheap).
+# Override with CHECK_INTERVAL env (seconds, clamped 5–60).
+def _resolve_check_interval() -> int:
+    raw = os.environ.get("CHECK_INTERVAL", "10").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Invalid CHECK_INTERVAL=%r, using 10", raw)
+        return 10
+    return max(5, min(60, value))
+
+
+CHECK_INTERVAL = _resolve_check_interval()
 
 
 def _sender_email_from_message(message: dict) -> str:
@@ -269,7 +282,7 @@ def start_background_jobs(
         application.job_queue.run_repeating(
             check_triggers,
             interval=CHECK_INTERVAL,
-            first=10,
+            first=min(5, CHECK_INTERVAL),
             name="trigger_check",
             data={"gmail_client": gmail_client, "storage": storage},
         )

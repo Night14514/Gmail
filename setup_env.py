@@ -7,12 +7,13 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 CREDENTIALS_NAME = "credentials.json"
 CREDENTIALS_DESKTOP_NAME = "credentials_desktop.json"
+CREDENTIALS_DESKTOP_ALIASES = (CREDENTIALS_DESKTOP_NAME, "credentials_device.json")
 TOKENS_DIR_NAME = "tokens"
 TOKEN_PREFIX = "token_"
 TOKEN_SUFFIX = ".json"
@@ -28,7 +29,7 @@ def credentials_path(root: Path | None = None) -> Path:
 
 def credentials_desktop_path(root: Path | None = None) -> Path:
     root = root or project_root()
-    for name in (CREDENTIALS_DESKTOP_NAME, "credentials_device.json"):
+    for name in CREDENTIALS_DESKTOP_ALIASES:
         path = root / name
         if path.is_file():
             return path
@@ -68,22 +69,29 @@ def environment_status(root: Path | None = None) -> dict:
     }
 
 
-def _is_credentials_member(name: str) -> bool:
-    normalized = name.replace("\\", "/").lstrip("./")
-    return Path(normalized).name.lower() == CREDENTIALS_NAME.lower()
-
-
 def _is_token_member(name: str) -> bool:
     normalized = name.replace("\\", "/").lstrip("./")
     base = Path(normalized).name
     return base.startswith(TOKEN_PREFIX) and base.endswith(TOKEN_SUFFIX)
 
 
+def _load_json_file(path: Path) -> Tuple[bool, Optional[str]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            json.load(f)
+        return True, None
+    except json.JSONDecodeError:
+        return False, f"{path.name} повреждён (невалидный JSON)"
+    except OSError as e:
+        return False, f"Не удалось прочитать {path.name}: {e}"
+
+
 def install_tokens_zip(zip_path: str | Path, root: Path | None = None) -> Tuple[bool, str]:
     """
     Unpack tokens.zip into project layout:
-      - credentials.json → project root
-      - token_*.json → tokens/
+      - token_*.json → tokens/ (required)
+      - credentials_desktop.json / credentials_device.json → credentials_desktop.json (optional)
+      - credentials.json → project root (optional)
     Accepts flat zip or nested folders (tokens/, etc.).
     """
     root = root or project_root()
@@ -95,11 +103,8 @@ def install_tokens_zip(zip_path: str | Path, root: Path | None = None) -> Tuple[
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
             names = zf.namelist()
-            cred_members = [n for n in names if not n.endswith("/") and _is_credentials_member(n)]
             token_members = [n for n in names if not n.endswith("/") and _is_token_member(n)]
 
-            if not cred_members:
-                return False, "В архиве нет credentials.json"
             if not token_members:
                 return False, "В архиве нет файлов token_*.json"
 
@@ -108,27 +113,32 @@ def install_tokens_zip(zip_path: str | Path, root: Path | None = None) -> Tuple[
                 zf.extractall(tmp_path)
 
                 found_cred: Path | None = None
+                found_desktop: Path | None = None
                 found_tokens: List[Path] = []
 
                 for path in tmp_path.rglob("*"):
                     if not path.is_file():
                         continue
-                    if path.name.lower() == CREDENTIALS_NAME.lower():
+                    name_lower = path.name.lower()
+                    if name_lower == CREDENTIALS_NAME.lower():
                         found_cred = path
+                    elif name_lower in {n.lower() for n in CREDENTIALS_DESKTOP_ALIASES}:
+                        found_desktop = path
                     elif path.name.startswith(TOKEN_PREFIX) and path.name.endswith(TOKEN_SUFFIX):
                         found_tokens.append(path)
 
-                if not found_cred:
-                    return False, "Не удалось извлечь credentials.json"
                 if not found_tokens:
                     return False, "Не удалось извлечь token_*.json"
 
-                # Validate credentials JSON
-                try:
-                    with open(found_cred, "r", encoding="utf-8") as f:
-                        json.load(f)
-                except json.JSONDecodeError:
-                    return False, "credentials.json повреждён (невалидный JSON)"
+                if found_cred:
+                    ok, err = _load_json_file(found_cred)
+                    if not ok:
+                        return False, err or "credentials.json повреждён"
+
+                if found_desktop:
+                    ok, err = _load_json_file(found_desktop)
+                    if not ok:
+                        return False, err or "credentials_desktop.json повреждён"
 
                 dest_tokens = tokens_dir(root)
                 dest_tokens.mkdir(parents=True, exist_ok=True)
@@ -140,15 +150,22 @@ def install_tokens_zip(zip_path: str | Path, root: Path | None = None) -> Tuple[
                     except OSError as e:
                         logger.warning("Failed to remove old token %s: %s", old, e)
 
-                shutil.copy2(found_cred, credentials_path(root))
+                installed: List[str] = []
+
+                if found_cred:
+                    shutil.copy2(found_cred, credentials_path(root))
+                    installed.append(CREDENTIALS_NAME)
+
+                if found_desktop:
+                    # Always normalize legacy name to credentials_desktop.json
+                    shutil.copy2(found_desktop, root / CREDENTIALS_DESKTOP_NAME)
+                    installed.append(CREDENTIALS_DESKTOP_NAME)
 
                 copied = 0
                 used_names = set()
                 for src in found_tokens:
-                    try:
-                        with open(src, "r", encoding="utf-8") as f:
-                            json.load(f)
-                    except json.JSONDecodeError:
+                    ok, _ = _load_json_file(src)
+                    if not ok:
                         logger.warning("Skipping invalid token JSON: %s", src)
                         continue
 
@@ -163,11 +180,10 @@ def install_tokens_zip(zip_path: str | Path, root: Path | None = None) -> Tuple[
                 if copied == 0:
                     return False, "Все token_*.json в архиве невалидны"
 
-                logger.info(
-                    "Installed setup from zip: credentials + %s token file(s)",
-                    copied,
-                )
-                return True, f"Установлено: credentials.json и {copied} token-файл(ов)"
+                installed.append(f"{copied} token-файл(ов)")
+                summary = ", ".join(installed)
+                logger.info("Installed setup from zip: %s", summary)
+                return True, f"Установлено: {summary}"
 
     except zipfile.BadZipFile:
         return False, "Файл не является корректным ZIP-архивом"

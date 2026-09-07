@@ -96,7 +96,7 @@ async def _prompt_setup_hint(update: Update) -> None:
         "Варианты:\n"
         "• «Все почты» → «➕ Добавить аккаунт» (OAuth-ссылка)\n"
         "• «➕ Добавить почту» (файл token_*.json)\n"
-        "• пришлите tokens.zip (credentials.json + token_*.json)"
+        "• пришлите tokens.zip (token_*.json + опционально credentials_desktop.json)"
     )
     target = update.effective_message
     if target:
