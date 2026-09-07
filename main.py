@@ -28,7 +28,7 @@ from storage import Storage
 from handlers import accounts, triggers, activity
 from background_jobs import start_background_jobs
 from setup_env import environment_ready, environment_status, install_tokens_zip, project_root
-import device_auth
+import oauth_desktop
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -94,7 +94,7 @@ async def _prompt_setup_hint(update: Update) -> None:
     text = (
         "⚙️ Пока нет подключённых почт.\n\n"
         "Варианты:\n"
-        "• «Все почты» → «➕ Добавить аккаунт» (Device OAuth)\n"
+        "• «Все почты» → «➕ Добавить аккаунт» (OAuth-ссылка)\n"
         "• «➕ Добавить почту» (файл token_*.json)\n"
         "• пришлите tokens.zip (credentials.json + token_*.json)"
     )
@@ -103,156 +103,137 @@ async def _prompt_setup_hint(update: Update) -> None:
         await target.reply_text(text)
 
 
-async def start_device_auth_flow(
+async def _finish_oauth_tokens(
     bot,
     chat_id: str,
     gmail_client: GmailClient,
     storage: Storage,
-    bot_data: dict,
+    tokens: dict,
+    client_id: str,
+    client_secret: str,
     *,
     expected_email: str | None = None,
     notify_owner_on_success: bool = False,
     registration_id: str | None = None,
     application: Application | None = None,
 ) -> None:
-    """Run OAuth Device Authorization Grant for one chat; no parallel flows per chat."""
-    active = bot_data.setdefault("active_device_auths", set())
-    chat_key = str(chat_id)
-    if chat_key in active:
+    scope_raw = tokens.get("scope", oauth_desktop.SCOPES)
+    scopes = scope_raw.split() if isinstance(scope_raw, str) else list(scope_raw)
+    creds = UserCredentials(
+        token=tokens["access_token"],
+        refresh_token=tokens.get("refresh_token"),
+        token_uri=oauth_desktop.TOKEN_URL,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=scopes,
+    )
+    raw_json = creds.to_json().encode("utf-8")
+
+    ok, message, email = gmail_client.add_account_from_json_bytes(raw_json)
+    if not ok:
+        await bot.send_message(chat_id, f"❌ Не удалось подключить почту: {message}")
+        return
+
+    if expected_email and email.lower() != expected_email.lower():
         await bot.send_message(
-            chat_id, "⏳ Уже идёт авторизация, дождитесь её завершения."
+            chat_id,
+            f"⚠️ Вы авторизовались как {email}, а заявка была на {expected_email}. "
+            "Почта всё равно подключена, но проверьте, что это правильный аккаунт.",
+        )
+
+    if registration_id:
+        try:
+            storage.update_registration_status(registration_id, "completed")
+        except Exception:
+            logger.exception("Failed to mark registration completed")
+
+    if application is not None:
+        _maybe_start_jobs(application)
+
+    await bot.send_message(chat_id, f"✅ Почта {email} подключена ({message}).")
+
+    filename = f"token_{email}.json"
+    if notify_owner_on_success:
+        owner_chat_id = storage.resolve_notify_chat_id()
+        if owner_chat_id and str(owner_chat_id) != str(chat_id):
+            await bot.send_message(
+                owner_chat_id, f"✅ Пользователь подключил почту {email}."
+            )
+            await bot.send_document(
+                owner_chat_id,
+                document=InputFile(BytesIO(raw_json), filename=filename),
+                caption="Резервная копия конфигурации.",
+            )
+    else:
+        await bot.send_document(
+            chat_id,
+            document=InputFile(BytesIO(raw_json), filename=filename),
+            caption=(
+                "Резервная копия конфигурации — сохраните на случай сбоя сервера."
+            ),
+        )
+
+
+async def start_oauth_link_flow(
+    bot,
+    chat_id: str,
+    bot_data: dict,
+    *,
+    expected_email: str | None = None,
+    notify_owner_on_success: bool = False,
+    registration_id: str | None = None,
+) -> None:
+    """Send Desktop OAuth URL; user pastes redirect URL/code back into Telegram."""
+    pending = bot_data.setdefault("pending_oauth", {})
+    chat_key = str(chat_id)
+    if chat_key in pending:
+        await bot.send_message(
+            chat_id, "⏳ Уже идёт авторизация, дождитесь её завершения или пришлите код."
         )
         return
 
-    active.add(chat_key)
     try:
-        try:
-            creds_data = device_auth.load_device_client_creds()
-        except Exception as e:
-            await bot.send_message(
-                chat_id,
-                f"❌ Не удалось прочитать credentials_device.json: {e}",
-            )
-            return
-
-        client_id = creds_data["client_id"]
-        client_secret = creds_data["client_secret"]
-
-        try:
-            device_info = await device_auth.request_device_code(client_id)
-        except Exception as e:
-            await bot.send_message(
-                chat_id, f"❌ Не удалось получить код авторизации: {e}"
-            )
-            return
-
-        verification_url = (
-            device_info.get("verification_url")
-            or device_info.get("verification_uri")
-            or "https://www.google.com/device"
-        )
-        minutes = max(1, int(device_info["expires_in"]) // 60)
-        user_code = device_info.get("user_code") or ""
+        creds_data = oauth_desktop.load_desktop_client_creds()
+    except Exception as e:
         await bot.send_message(
-            chat_id,
-            f"🔑 Перейдите на {html.escape(verification_url)} и введите код:\n\n"
-            f"<code>{html.escape(user_code)}</code>\n\n"
-            f"Код действителен {minutes} мин. Как только вы авторизуетесь — бот сам продолжит.",
-            parse_mode="HTML",
+            chat_id, f"❌ Не удалось прочитать credentials_desktop.json: {e}"
         )
+        return
 
-        result = await device_auth.poll_for_token(
-            client_id,
-            client_secret,
-            device_info["device_code"],
-            int(device_info.get("interval", 5)),
-            int(device_info["expires_in"]),
-        )
+    client_id = creds_data["client_id"]
+    client_secret = creds_data.get("client_secret") or ""
+    try:
+        auth = oauth_desktop.build_authorization_url(client_id)
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Не удалось сформировать ссылку: {e}")
+        return
 
-        if not result["ok"]:
-            reasons = {
-                "access_denied": "❌ Вы отклонили запрос доступа.",
-                "expired_token": "❌ Время на ввод кода истекло. Попробуйте снова.",
-            }
-            await bot.send_message(
-                chat_id,
-                reasons.get(
-                    result["reason"],
-                    f"❌ Ошибка авторизации: {result['reason']}",
-                ),
-            )
-            return
+    pending[chat_key] = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code_verifier": auth["code_verifier"],
+        "state": auth["state"],
+        "redirect_uri": auth["redirect_uri"],
+        "expected_email": expected_email,
+        "notify_owner_on_success": notify_owner_on_success,
+        "registration_id": registration_id,
+    }
 
-        tokens = result["tokens"]
-        scope_raw = tokens.get("scope", device_auth.SCOPES)
-        scopes = scope_raw.split() if isinstance(scope_raw, str) else list(scope_raw)
-        creds = UserCredentials(
-            token=tokens["access_token"],
-            refresh_token=tokens.get("refresh_token"),
-            token_uri=device_auth.TOKEN_URL,
-            client_id=client_id,
-            client_secret=client_secret,
-            scopes=scopes,
-        )
-        raw_json = creds.to_json().encode("utf-8")
-
-        ok, message, email = gmail_client.add_account_from_json_bytes(raw_json)
-        if not ok:
-            await bot.send_message(
-                chat_id, f"❌ Не удалось подключить почту: {message}"
-            )
-            return
-
-        if expected_email and email.lower() != expected_email.lower():
-            await bot.send_message(
-                chat_id,
-                f"⚠️ Вы авторизовались как {email}, а заявка была на {expected_email}. "
-                "Почта всё равно подключена, но проверьте, что это правильный аккаунт.",
-            )
-
-        if registration_id:
-            try:
-                storage.update_registration_status(registration_id, "completed")
-            except Exception:
-                logger.exception("Failed to mark registration completed")
-
-        if application is not None:
-            _maybe_start_jobs(application)
-
-        await bot.send_message(chat_id, f"✅ Почта {email} подключена ({message}).")
-
-        filename = f"token_{email}.json"
-
-        if notify_owner_on_success:
-            owner_chat_id = storage.resolve_notify_chat_id()
-            if owner_chat_id and str(owner_chat_id) != str(chat_id):
-                await bot.send_message(
-                    owner_chat_id, f"✅ Пользователь подключил почту {email}."
-                )
-                await bot.send_document(
-                    owner_chat_id,
-                    document=InputFile(BytesIO(raw_json), filename=filename),
-                    caption="Резервная копия конфигурации.",
-                )
-        else:
-            await bot.send_document(
-                chat_id,
-                document=InputFile(BytesIO(raw_json), filename=filename),
-                caption=(
-                    "Резервная копия конфигурации — сохраните на случай сбоя сервера."
-                ),
-            )
-    except Exception:
-        logger.exception("Device auth flow failed for chat %s", chat_id)
-        try:
-            await bot.send_message(chat_id, "❌ Сбой авторизации. Попробуйте снова.")
-        except Exception:
-            pass
-    finally:
-        active.discard(chat_key)
+    await bot.send_message(
+        chat_id,
+        "🔑 Откройте ссылку и войдите в Google-аккаунт:\n"
+        f"{auth['auth_url']}\n\n"
+        "После разрешения браузер откроет страницу "
+        f"<code>{html.escape(oauth_desktop.REDIRECT_URI)}/?code=...</code> "
+        "(сайт не откроется — это нормально).\n\n"
+        "Скопируйте <b>весь адрес</b> из строки браузера и пришлите его сюда "
+        "(или только значение параметра code=).",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
-def _schedule_device_auth(
+def _schedule_oauth_link(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: str,
     *,
@@ -260,24 +241,79 @@ def _schedule_device_auth(
     notify_owner_on_success: bool = False,
     registration_id: str | None = None,
 ) -> bool:
-    """Create device-auth task if no parallel flow for chat. Returns False if busy."""
-    active = context.bot_data.setdefault("active_device_auths", set())
+    pending = context.bot_data.setdefault("pending_oauth", {})
     chat_key = str(chat_id)
-    if chat_key in active:
+    if chat_key in pending:
         return False
     asyncio.create_task(
-        start_device_auth_flow(
+        start_oauth_link_flow(
             context.bot,
             chat_key,
-            context.bot_data["gmail_client"],
-            context.bot_data["storage"],
             context.bot_data,
             expected_email=expected_email,
             notify_owner_on_success=notify_owner_on_success,
             registration_id=registration_id,
-            application=context.application,
         )
     )
+    return True
+
+
+async def handle_oauth_code_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """If this chat has pending OAuth, consume pasted code. Returns True if handled."""
+    chat = update.effective_chat
+    if not chat or not update.message:
+        return False
+    chat_key = str(chat.id)
+    pending_map = context.bot_data.setdefault("pending_oauth", {})
+    session = pending_map.get(chat_key)
+    if not session:
+        return False
+
+    text = update.message.text or ""
+    code = oauth_desktop.extract_auth_code(text)
+    if not code:
+        await update.message.reply_text(
+            "Не вижу код авторизации. Пришлите полный URL из адресной строки "
+            "(с code=...) или сам код после авторизации."
+        )
+        return True
+
+    await update.message.reply_text("⏳ Обмениваю код на токен…")
+    result = await oauth_desktop.exchange_code_for_tokens(
+        session["client_id"],
+        session["client_secret"],
+        code,
+        session["code_verifier"],
+        session.get("redirect_uri", oauth_desktop.REDIRECT_URI),
+    )
+    if not result["ok"]:
+        await update.message.reply_text(
+            f"❌ Не удалось получить токен: {result['reason']}\n"
+            "Попробуйте «➕ Добавить аккаунт» снова и пришлите свежий код."
+        )
+        pending_map.pop(chat_key, None)
+        return True
+
+    pending_map.pop(chat_key, None)
+    try:
+        await _finish_oauth_tokens(
+            context.bot,
+            chat_key,
+            context.bot_data["gmail_client"],
+            context.bot_data["storage"],
+            result["tokens"],
+            session["client_id"],
+            session["client_secret"],
+            expected_email=session.get("expected_email"),
+            notify_owner_on_success=bool(session.get("notify_owner_on_success")),
+            registration_id=session.get("registration_id"),
+            application=context.application,
+        )
+    except Exception:
+        logger.exception("OAuth finish failed for chat %s", chat_key)
+        await update.message.reply_text("❌ Сбой после получения токена. Попробуйте снова.")
     return True
 
 
@@ -314,13 +350,13 @@ async def handle_guest_flow(
         )
         context.user_data["awaiting_registration_email"] = True
     elif request["status"] == "approved":
-        if not device_auth.credentials_device_exists():
+        if not oauth_desktop.credentials_desktop_exists():
             await update.message.reply_text(
-                "Заявка подтверждена, но на сервере нет credentials_device.json. "
+                "Заявка подтверждена, но на сервере нет credentials_desktop.json. "
                 "Напишите владельцу."
             )
             return
-        if not _schedule_device_auth(
+        if not _schedule_oauth_link(
             context,
             str(request["chat_id"]),
             expected_email=request.get("email"),
@@ -328,11 +364,11 @@ async def handle_guest_flow(
             registration_id=request.get("id"),
         ):
             await update.message.reply_text(
-                "⏳ Уже идёт авторизация, дождитесь её завершения."
+                "⏳ Уже идёт авторизация — откройте ссылку выше или пришлите код из браузера."
             )
             return
         await update.message.reply_text(
-            "✅ Ваша заявка уже подтверждена. Запрашиваю код авторизации у Google…"
+            "✅ Ваша заявка уже подтверждена. Отправляю ссылку для авторизации…"
         )
     elif request["status"] == "completed":
         await update.message.reply_text(
@@ -348,7 +384,7 @@ async def handle_guest_flow(
 async def start_add_account_flow(
     update: Update, context: ContextTypes.DEFAULT_TYPE, *, via_message: bool = False
 ) -> None:
-    """Owner: start Device Authorization Grant account add."""
+    """Owner: start Desktop OAuth account add (paste code from browser)."""
     query = update.callback_query
     reply = (
         (lambda text, **kw: query.edit_message_text(text, **kw))
@@ -360,26 +396,28 @@ async def start_add_account_flow(
         return
     chat_id = str(chat.id)
 
-    if not device_auth.credentials_device_exists():
+    if not oauth_desktop.credentials_desktop_exists():
         await reply(
-            "⚠️ Не найден credentials_device.json.\n\n"
-            "Создайте OAuth-клиент типа «TVs and Limited Input devices» "
-            "в Google Cloud Console и пришлите файл credentials_device.json.",
+            "⚠️ Не найден credentials_desktop.json.\n\n"
+            "Создайте OAuth-клиент типа «Desktop app» в Google Cloud Console "
+            "и пришлите файл credentials_desktop.json "
+            "(credentials_device.json от TV-клиента для Gmail не подходит).",
             reply_markup=_back_to_accounts_kb() if query and not via_message else None,
         )
-        context.user_data["waiting_for_credentials_device"] = True
+        context.user_data["waiting_for_credentials_desktop"] = True
         return
 
-    active = context.bot_data.setdefault("active_device_auths", set())
-    if chat_id in active:
+    pending = context.bot_data.setdefault("pending_oauth", {})
+    if chat_id in pending:
         await reply(
-            "⏳ Уже идёт авторизация, дождитесь её завершения.",
+            "⏳ Уже идёт авторизация — пришлите код/URL из браузера "
+            "или дождитесь завершения.",
             reply_markup=_back_to_accounts_kb() if query and not via_message else None,
         )
         return
 
-    await reply("⏳ Запрашиваю код авторизации у Google…")
-    _schedule_device_auth(context, chat_id, notify_owner_on_success=False)
+    await reply("⏳ Готовлю ссылку авторизации…")
+    _schedule_oauth_link(context, chat_id, notify_owner_on_success=False)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -446,29 +484,29 @@ async def handle_approve_reg(
 
     await query.answer()
 
-    if not device_auth.credentials_device_exists():
+    if not oauth_desktop.credentials_desktop_exists():
         await query.edit_message_text(
-            f"⚠️ Не найден credentials_device.json — нельзя запустить авторизацию "
+            f"⚠️ Не найден credentials_desktop.json — нельзя запустить авторизацию "
             f"для {request['email']}.\n\n"
-            "Заявка остаётся в статусе pending — пришлите файл и нажмите "
+            "Заявка остаётся в статусе pending — пришлите Desktop OAuth JSON и нажмите "
             "✅ Подтвердить снова."
         )
         return
 
-    active = context.bot_data.setdefault("active_device_auths", set())
-    if str(request["chat_id"]) in active:
+    pending = context.bot_data.setdefault("pending_oauth", {})
+    if str(request["chat_id"]) in pending:
         await query.edit_message_text(
-            f"⏳ Для пользователя уже идёт авторизация. Дождитесь завершения "
-            f"и при необходимости нажмите ✅ снова (заявка пока pending)."
+            "⏳ Для пользователя уже идёт авторизация. Дождитесь завершения "
+            "и при необходимости нажмите ✅ снова (заявка пока pending)."
         )
         return
 
     storage.update_registration_status(request_id, "approved")
     storage.ensure_user_allowed_contributor(request["user_id"])
     await query.edit_message_text(
-        f"✅ Подтверждено: {request['email']}\nЗапускаю авторизацию для пользователя…"
+        f"✅ Подтверждено: {request['email']}\nОтправляю ссылку авторизации пользователю…"
     )
-    _schedule_device_auth(
+    _schedule_oauth_link(
         context,
         str(request["chat_id"]),
         expected_email=request["email"],
@@ -655,6 +693,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _handle_registration_email(update, context)
         return
 
+    # OAuth paste (owner or contributor with pending session)
+    if await handle_oauth_code_message(update, context):
+        return
+
     if role != "owner":
         if role in ("contributor", "guest"):
             await handle_guest_flow(update, context, is_new=False)
@@ -669,7 +711,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif user_data.get("waiting_for_activity_sender"):
         await activity.process_sender_input(update, context)
     elif user_data.get("waiting_for_token_json") or user_data.get(
-        "waiting_for_credentials_device"
+        "waiting_for_credentials_desktop"
     ):
         await update.message.reply_text("Ожидается файл, а не текст. Пришлите документ.")
     elif _setup_needed(context):
@@ -694,25 +736,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     gmail_client: GmailClient = context.bot_data["gmail_client"]
 
     if (
-        filename_lower == "credentials_device.json"
-        or context.user_data.get("waiting_for_credentials_device")
+        filename_lower in ("credentials_desktop.json", "credentials_device.json")
+        or context.user_data.get("waiting_for_credentials_desktop")
     ):
-        if filename_lower != "credentials_device.json":
+        if filename_lower not in (
+            "credentials_desktop.json",
+            "credentials_device.json",
+        ):
             await update.message.reply_text(
-                "Нужен файл с именем credentials_device.json"
+                "Нужен файл credentials_desktop.json (OAuth Desktop app)."
             )
             return
-        dest = device_auth.credentials_device_path()
+        dest = project_root() / "credentials_desktop.json"
         try:
             tg_file = await doc.get_file()
             await tg_file.download_to_drive(custom_path=str(dest))
         except Exception as e:
-            logger.exception("Failed to save credentials_device.json")
+            logger.exception("Failed to save credentials_desktop.json")
             await update.message.reply_text(f"❌ Не удалось сохранить файл: {e}")
             return
-        context.user_data["waiting_for_credentials_device"] = False
+        context.user_data["waiting_for_credentials_desktop"] = False
         await update.message.reply_text(
-            "✅ credentials_device.json сохранён. Нажмите «➕ Добавить аккаунт» снова."
+            "✅ credentials_desktop.json сохранён. Нажмите «➕ Добавить аккаунт» снова.\n"
+            "Нужен клиент типа Desktop app (не TVs / Limited Input)."
         )
         return
 
@@ -769,7 +815,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     if not wants_setup:
         await update.message.reply_text(
-            "Сейчас ожидаются token_*.json, credentials_device.json или tokens.zip."
+            "Сейчас ожидаются token_*.json, credentials_desktop.json или tokens.zip."
         )
         return
 
@@ -857,10 +903,10 @@ def main() -> None:
     ready = environment_ready()
     status = environment_status()
     logger.info(
-        "Environment: ready=%s credentials=%s credentials_device=%s tokens=%s owner=%s",
+        "Environment: ready=%s credentials=%s credentials_desktop=%s tokens=%s owner=%s",
         status["ready"],
         status["has_credentials"],
-        status.get("has_credentials_device"),
+        status.get("has_credentials_desktop"),
         status["token_count"],
         storage.get_owner_id(),
     )
@@ -878,7 +924,7 @@ def main() -> None:
     application.bot_data["storage"] = storage
     application.bot_data["env_ready"] = ready
     application.bot_data["jobs_started"] = False
-    application.bot_data["active_device_auths"] = set()
+    application.bot_data["pending_oauth"] = {}
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("new", new_command))
@@ -893,7 +939,7 @@ def main() -> None:
         application.bot_data["jobs_started"] = True
     else:
         logger.warning(
-            "No tokens yet — owner can add via Device OAuth, token file, or tokens.zip"
+            "No tokens yet — owner can add via OAuth link, token file, or tokens.zip"
         )
 
     logger.info("Starting bot...")

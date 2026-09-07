@@ -14,7 +14,7 @@
 
 ## Что не коммитить
 
-- `credentials.json` / `credentials_device.json`
+- `credentials.json` / `credentials_desktop.json`
 - `tokens/` — `token_*.json`
 - `tokens.zip` / `uploads/`
 - `data/bot_config.json`, `pending_registrations.json`, `history_state.json`
@@ -40,28 +40,30 @@ export GOOGLE_CLOUD_PROJECT_ID='your-gcp-project-id'
 | `TELEGRAM_BOT_TOKEN` | токен бота (обязательно) |
 | `GOOGLE_CLOUD_PROJECT_ID` | ID проекта GCP (ссылка на Test users при одобрении) |
 
-### Настройка Device OAuth (опционально)
+### Настройка Desktop OAuth (опционально)
 
-OAuth **Device Authorization Grant** (RFC 8628) — без туннеля, порта и домена.
-Бот показывает код → пользователь вводит его на https://www.google.com/device с любого устройства.
+Без туннеля и входящего порта. Google **Device Flow не поддерживает Gmail scopes** —
+поэтому используется Desktop-клиент и вставка кода из браузера:
 
-1. В Google Cloud Console создайте OAuth client ID типа **TVs and Limited Input devices** (не Web application).
-2. Скачайте JSON и сохраните как `credentials_device.json` в корень проекта (или пришлите боту файлом).
-3. Пока приложение не верифицировано, добавляйте Test users в Audience.
+1. В Google Cloud Console создайте OAuth client ID типа **Desktop app** (не Web, не TVs).
+2. Скачайте JSON → `credentials_desktop.json` в корень проекта (или пришлите боту файлом).
+3. «➕ Добавить аккаунт» → откройте ссылку → после согласия скопируйте URL
+   `http://127.0.0.1:8765/?code=...` из адресной строки (страница не откроется — так и должно быть) → пришлите боту.
+4. Пока приложение не верифицировано, добавляйте Test users в Audience.
 
 ### Вариант A: файлы уже на диске
 
 - `tokens/token_*.json` (достаточно для работы)
-- опционально `credentials.json` / `credentials_device.json`
+- опционально `credentials.json` / `credentials_desktop.json`
 
 ### Вариант B: первый запуск без почт
 
 1. `/start` → владелец видит меню сразу.
-2. Добавить почту: Device OAuth («➕ Добавить аккаунт»), файл `token_*.json` или **tokens.zip**.
+2. Добавить почту: OAuth-ссылка («➕ Добавить аккаунт»), файл `token_*.json` или **tokens.zip**.
 
 ## Меню владельца
 
-- **Все почты** — список; сверху «➕ Добавить аккаунт» (код Google device), снизу «➕ Добавить почту» (файл `token_*.json`)
+- **Все почты** — список; сверху «➕ Добавить аккаунт» (OAuth-ссылка), снизу «➕ Добавить почту» (файл `token_*.json`)
 - **Триггеры** — уведомления о новых письмах (History API, ~30 с)
 - **Активность** — сканирование по отправителю
 
@@ -70,7 +72,7 @@ OAuth **Device Authorization Grant** (RFC 8628) — без туннеля, по�
 ## Онбординг пользователей
 
 1. Гость: `/start` → вводит email → заявка владельцу.
-2. Владелец: Test user в GCP → ✅ Подтвердить → пользователю приходит код для https://www.google.com/device.
+2. Владелец: Test user в GCP → ✅ Подтвердить → пользователю ссылка OAuth + инструкция вставить код.
 3. После OAuth почта появляется у владельца; JSON-бэкап уходит владельцу.
 
 Повторная регистрация той же почты (pending / approved / уже подключена) блокируется.
