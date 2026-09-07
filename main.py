@@ -420,6 +420,40 @@ async def start_add_account_flow(
     _schedule_oauth_link(context, chat_id, notify_owner_on_success=False)
 
 
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear pending OAuth sessions (owner: all; others: own chat only)."""
+    storage = context.bot_data.get("storage")
+    if not storage or not update.message:
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+
+    pending = context.bot_data.setdefault("pending_oauth", {})
+    role = get_role(update, storage)
+    chat_key = str(chat.id)
+
+    if role == "owner":
+        cleared = len(pending)
+        pending.clear()
+        context.user_data.pop("waiting_for_credentials_desktop", None)
+        context.user_data.pop("waiting_for_token_json", None)
+        await update.message.reply_text(
+            f"🧹 Очищено pending OAuth-сессий: {cleared}."
+            if cleared
+            else "🧹 Список pending пуст — очищать нечего."
+        )
+        return
+
+    if chat_key in pending:
+        pending.pop(chat_key, None)
+        await update.message.reply_text("🧹 Ваша pending-авторизация сброшена.")
+    else:
+        await update.message.reply_text("🧹 У вас нет активной pending-авторизации.")
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     storage = context.bot_data.get("storage")
     if not storage or not update.message:
@@ -885,6 +919,7 @@ async def _post_init(application: Application) -> None:
             [
                 BotCommand("start", "Открыть меню бота"),
                 BotCommand("new", "Добавить ещё одну почту"),
+                BotCommand("clear", "Сбросить pending-авторизации"),
             ]
         )
         await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
@@ -928,6 +963,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("new", new_command))
+    application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(
